@@ -1,12 +1,12 @@
 # UTM Bridge FDB Guard
 
-[简体中文](README.zh-CN.md) · [Technical background](docs/technical-background.md) · [Security policy](SECURITY.md)
+[简体中文](README.zh-CN.md) · [Technical background](docs/technical-background.md) · [Security notes](SECURITY.md)
 
-`utm-bridge-fdb-guard` is a narrowly scoped, fail-closed macOS LaunchDaemon workaround for a stale bridge forwarding-database (FDB) entry that can disrupt connectivity between a Mac host and a bridged UTM guest.
+`utm-bridge-fdb-guard` is a small macOS helper I put together while troubleshooting a stale bridge forwarding-database (FDB) entry that disrupted connectivity between my Mac and a bridged UTM guest.
 
-The guard discovers the live bridge topology on every run. It does **not** pin a virtual machine MAC address, bridge number, `vmenet` number, or host MAC address. When—and only when—all safety checks agree, it removes one exact, dynamic FDB entry for the physical uplink's own MAC address. Ambiguous or unfamiliar state is left untouched.
+I made the original workaround reusable because it may help someone with the same rather specific problem. It discovers the live bridge topology on every run instead of pinning a virtual machine MAC address, bridge number, `vmenet` number, or host MAC address. It removes one exact dynamic FDB entry only when the expected evidence agrees; otherwise it leaves the network alone.
 
-This project is an independent workaround for observed Apple `vmnet`/macOS bridge behavior. It is not an upstream fix from Apple or UTM.
+> This is a personal, best-effort project shared as-is. I may update it when I have the time and need, but there is no support promise, response-time commitment, maintenance schedule, roadmap, or compatibility guarantee. It is not an upstream fix from Apple or UTM.
 
 ## Why this exists
 
@@ -20,7 +20,7 @@ Deleting that one stale entry restores connectivity in observed cases:
 
 Running that command without strong validation would be unsafe. This project automates it only after validating the bridge, uplink, active `vmenet` evidence, target uniqueness, entry type, and a second fresh snapshot immediately before the change.
 
-## Safety model
+## What it checks before changing anything
 
 The default policy is deliberately conservative:
 
@@ -34,7 +34,7 @@ The default policy is deliberately conservative:
 
 The guard never flushes a bridge table. It does not modify IP addresses, routes, DNS, packet-filter rules, UTM configuration, or guest configuration, and it does not restart a VM.
 
-## Requirements and scope
+## Where it may help
 
 - macOS with `/sbin/ifconfig`, `launchd`, and a UTM bridged network backed by Apple virtualization networking.
 - Administrator access for installation and for the FDB change.
@@ -156,7 +156,7 @@ sudo ./scripts/uninstall.zsh --keep-config
 
 A later normal install reuses that preserved configuration after validating that it is the only file left in the package directory and remains owned by `root:wheel`. Use `--upgrade --reconfigure` if you want to replace it instead.
 
-## Operational guidance
+## Practical notes
 
 - Run `scan` and `run --dry-run` before enabling the workaround on an unfamiliar Mac.
 - Re-run `doctor` after macOS, UTM, network-adapter, or topology changes.
@@ -166,11 +166,11 @@ A later normal install reuses that preserved configuration after validating that
 
 For the underlying decision model and limitations, see [docs/technical-background.md](docs/technical-background.md). A related UTM discussion is [UTM issue #7121](https://github.com/utmapp/UTM/issues/7121).
 
-## Contributing
+## Issues and patches
 
-Bug reports with sanitized `scan` output and macOS/UTM versions are welcome. Parser changes should include fixtures for both the accepted form and nearby forms that must fail closed. CI must never perform a real `ifconfig ... deladdr` operation.
+Sanitized bug reports and small patches are welcome, but responses and fixes are best-effort and may take time—or may not happen. If you change the parser, please include fixtures for both the accepted form and nearby forms that should be rejected. CI must never perform a real `ifconfig ... deladdr` operation.
 
-Please report security issues privately as described in [SECURITY.md](SECURITY.md).
+If you notice a security-sensitive problem, [SECURITY.md](SECURITY.md) explains the available private reporting option and the project's maintenance limits.
 
 ## License
 

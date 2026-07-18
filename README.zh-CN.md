@@ -1,12 +1,12 @@
 # UTM Bridge FDB Guard
 
-[English](README.md) · [技术原理](docs/technical-background.md) · [安全策略](SECURITY.md)
+[English](README.md) · [技术原理](docs/technical-background.md) · [安全说明](SECURITY.md)
 
-`utm-bridge-fdb-guard` 是一个范围严格、默认拒绝操作（fail-closed）的 macOS LaunchDaemon，用来规避某类陈旧桥接转发表（FDB）记录导致的 Mac 宿主机与 UTM 桥接虚拟机之间无法通信的问题。
+`utm-bridge-fdb-guard` 是我在排查自己 Mac 与 UTM 桥接虚拟机无法通信的问题时，顺手整理出来的一个小工具。它处理的是一类比较具体的陈旧桥接转发表（FDB）记录问题。
 
-守护程序每次运行都会从当前网络状态重新发现 bridge、`vmenet`、物理上联接口和宿主 MAC，**不会固定虚拟机 MAC、bridge 编号、`vmenet` 编号或宿主 MAC**。只有全部安全条件同时成立时，它才删除一条经过精确确认的动态 FDB 记录；状态不明确或格式无法识别时不会做任何修改。
+我把原先针对自己机器的处理方式改成了可复用形式，希望对遇到同类问题的人也有一点帮助。程序每次运行都会从当前网络状态重新发现 bridge、`vmenet`、物理上联接口和宿主 MAC，**不会固定虚拟机 MAC、bridge 编号、`vmenet` 编号或宿主 MAC**。只有预期证据能够互相印证时，它才删除一条明确的动态 FDB 记录；拿不准就不动网络。
 
-本项目是针对已观测到的 Apple `vmnet`/macOS bridge 行为所做的独立规避方案，并非 Apple 或 UTM 提供的上游修复。
+> 这是一个按现状分享的个人项目。我可能会在自己有时间、有需要时继续调整，但不承诺支持时限、回复速度、维护周期、路线图或长期兼容性。它也不是 Apple 或 UTM 提供的上游修复。
 
 ## 问题表现
 
@@ -20,7 +20,7 @@
 
 直接自动执行这条命令并不安全。因此，本项目会先验证 bridge 成员、上联接口、真实 `vmenet` 上的 guest 学习证据、目标唯一性和动态属性，并在修改前重新获取第二份快照。两次判断不完全一致就拒绝操作。
 
-## 安全模型
+## 动手前会检查什么
 
 默认策略刻意保持保守：
 
@@ -34,7 +34,7 @@
 
 程序永远不会清空整张 FDB，也不会修改 IP、路由、DNS、包过滤规则、UTM 配置或虚拟机配置，更不会重启虚拟机。
 
-## 适用范围
+## 适合什么情况
 
 - 使用 `/sbin/ifconfig` 与 `launchd` 的 macOS。
 - 通过 Apple 虚拟化网络创建 UTM 桥接网络。
@@ -157,7 +157,7 @@ sudo ./scripts/uninstall.zsh --keep-config
 
 之后直接正常安装时，安装器会复用这份配置；复用前会确认它是软件目录中唯一保留的文件，且仍归 `root:wheel` 所有。如需替换配置，请改用 `--upgrade --reconfigure`。
 
-## 使用建议
+## 实用提示
 
 - 在陌生 Mac 上启用前，先运行 `scan` 和 `run --dry-run`。
 - macOS、UTM、网卡或网络拓扑变化后重新运行 `doctor`。
@@ -167,11 +167,11 @@ sudo ./scripts/uninstall.zsh --keep-config
 
 更完整的判断模型与限制见 [docs/technical-background.md](docs/technical-background.md)。相关讨论可参考 [UTM issue #7121](https://github.com/utmapp/UTM/issues/7121)。
 
-## 贡献与安全问题
+## 问题反馈与修改
 
-欢迎提交已经脱敏的 `scan` 输出以及 macOS/UTM 版本。涉及解析器的修改应同时加入“应接受”和相邻“必须拒绝”的测试夹具；CI 不得真正执行 `ifconfig ... deladdr`。
+欢迎提交已经脱敏的问题信息或小改动，但回复和修复都只能随缘、尽力而为，可能较慢，也可能暂时不会处理。涉及解析器的修改最好同时加入“应接受”和相邻“应拒绝”的测试夹具；CI 不得真正执行 `ifconfig ... deladdr`。
 
-安全问题请根据 [SECURITY.md](SECURITY.md) 私下报告。
+如果发现涉及安全的问题，[SECURITY.md](SECURITY.md) 说明了可用的私密反馈方式，也明确了这个个人项目不提供哪些维护承诺。
 
 ## 许可证
 

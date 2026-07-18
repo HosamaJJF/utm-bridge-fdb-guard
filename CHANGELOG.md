@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- Reframed the repository as a best-effort personal utility and removed maintenance and response-time promises.
+
 ## [1.0.0] - 2026-07-18
 
 ### Added
