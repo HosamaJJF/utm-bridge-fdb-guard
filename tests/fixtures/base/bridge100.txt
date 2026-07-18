@@ -1,0 +1,13 @@
+bridge100: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 02:00:00:00:30:01
+	Configuration:
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+	member: vmenet0 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 26 priority 0 path cost 0
+	member: en0 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 7 priority 0 path cost 0
+	Address cache:
+		02:00:00:00:20:01 Vlan1 vmenet0 1200 flags=0<>
+		02:00:00:00:10:01 Vlan1 en0 1199 flags=0<>
+	media: autoselect
+	status: active

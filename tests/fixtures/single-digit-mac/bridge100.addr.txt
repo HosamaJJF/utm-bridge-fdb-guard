@@ -1,0 +1,2 @@
+2:0:0:0:20:1 Vlan1 vmenet0 1200 flags=0<>
+2:0:0:0:10:1 Vlan1 en0 1199 flags=0<>

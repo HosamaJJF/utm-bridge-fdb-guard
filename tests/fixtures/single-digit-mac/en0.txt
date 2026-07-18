@@ -1,0 +1,4 @@
+en0: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	ether 2:0:0:0:10:1
+	media: autoselect
+	status: active

@@ -1,0 +1,750 @@
+#!/bin/zsh -f
+
+# Fail-closed workaround for stale Apple vmnet bridge FDB entries.
+# See docs/technical-background.md for the observed failure mode.
+
+emulate -L zsh
+setopt NO_UNSET PIPE_FAIL EXTENDED_GLOB
+umask 077
+
+readonly TOOL_VERSION="1.0.0"
+readonly SERVICE_LABEL="io.github.hosamajjf.utm-bridge-fdb-guard"
+readonly DEFAULT_CONFIG="/Library/Application Support/UTMBridgeFDBGuard/config.plist"
+readonly DEFAULT_LOCK_FILE="/Library/Application Support/UTMBridgeFDBGuard/run.lock"
+
+# Test overrides are deliberately unavailable to privileged processes. A
+# LaunchDaemon or sudo invocation always uses the fixed macOS system tools.
+if [[ "${UTM_BRIDGE_GUARD_TEST_MODE:-0}" == "1" && EUID -ne 0 ]]; then
+  readonly TEST_MODE=1
+  readonly IFCONFIG_BIN="${UTM_BRIDGE_GUARD_IFCONFIG:-/sbin/ifconfig}"
+  readonly LOGGER_BIN="${UTM_BRIDGE_GUARD_LOGGER:-/usr/bin/logger}"
+  readonly PLUTIL_BIN="${UTM_BRIDGE_GUARD_PLUTIL:-/usr/bin/plutil}"
+  readonly STAT_BIN="${UTM_BRIDGE_GUARD_STAT:-/usr/bin/stat}"
+  readonly LAUNCHCTL_BIN="${UTM_BRIDGE_GUARD_LAUNCHCTL:-/bin/launchctl}"
+  readonly LOCK_FILE="${UTM_BRIDGE_GUARD_LOCK_FILE:-${DEFAULT_LOCK_FILE}}"
+else
+  readonly TEST_MODE=0
+  readonly IFCONFIG_BIN="/sbin/ifconfig"
+  readonly LOGGER_BIN="/usr/bin/logger"
+  readonly PLUTIL_BIN="/usr/bin/plutil"
+  readonly STAT_BIN="/usr/bin/stat"
+  readonly LAUNCHCTL_BIN="/bin/launchctl"
+  readonly LOCK_FILE="${DEFAULT_LOCK_FILE}"
+fi
+
+typeset command_name="${1:-help}"
+if (( $# > 0 )); then
+  shift
+fi
+
+typeset config_path="${DEFAULT_CONFIG}"
+typeset cli_dry_run=0
+typeset verbose=0
+
+usage() {
+  print "Usage:"
+  print "  utm-bridge-fdb-guard scan   [--config PATH] [--verbose]"
+  print "  utm-bridge-fdb-guard run    [--config PATH] [--dry-run] [--verbose]"
+  print "  utm-bridge-fdb-guard doctor [--config PATH]"
+  print "  utm-bridge-fdb-guard version"
+}
+
+fail() {
+  print -u2 -- "utm-bridge-fdb-guard: $*"
+  return 1
+}
+
+log_error() {
+  local message="$*"
+  print -u2 -- "utm-bridge-fdb-guard: ${message}"
+
+  if [[ "${TEST_MODE}" == "1" || ! -x "${LOGGER_BIN}" ]]; then
+    return 0
+  fi
+  "${LOGGER_BIN}" -t utm-bridge-fdb-guard "${message}" 2>/dev/null || true
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --config)
+      (( $# >= 2 )) || { fail "--config requires a path"; exit 2; }
+      config_path="$2"
+      shift 2
+      ;;
+    --dry-run)
+      cli_dry_run=1
+      shift
+      ;;
+    --verbose)
+      verbose=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "unknown argument: $1"
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "${command_name}" in
+  scan|run|doctor|version|help) ;;
+  *)
+    fail "unknown command: ${command_name}"
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${command_name}" == "version" ]]; then
+  print "utm-bridge-fdb-guard ${TOOL_VERSION}"
+  exit 0
+fi
+if [[ "${command_name}" == "help" ]]; then
+  usage
+  exit 0
+fi
+
+typeset cfg_bridge_policy
+typeset cfg_uplink_policy
+typeset cfg_guest_evidence
+typeset cfg_dry_run
+typeset -a cfg_allowed_bridges
+typeset -a cfg_allowed_uplinks
+typeset -a cfg_allowed_guest_macs
+
+plist_raw() {
+  "${PLUTIL_BIN}" -extract "$1" raw -o - "${config_path}" 2>/dev/null
+}
+
+plist_array() {
+  local key="$1"
+  local count i
+  typeset -ga PLIST_ARRAY_RESULT
+  PLIST_ARRAY_RESULT=()
+  count="$(plist_raw "${key}")" || return 1
+  [[ "${count}" == <-> ]] || return 1
+  for (( i = 0; i < count; i++ )); do
+    PLIST_ARRAY_RESULT+=("$(plist_raw "${key}.${i}")") || return 1
+  done
+}
+
+valid_interface_name() {
+  [[ "$1" =~ '^[A-Za-z][A-Za-z0-9._-]*$' ]]
+}
+
+valid_bridge_name() {
+  [[ "$1" =~ '^bridge[0-9]+$' ]]
+}
+
+normalize_mac() {
+  local raw="${1:l}"
+  local -a parts
+  local part formatted output=""
+  local value
+
+  parts=("${(@s.:.)raw}")
+  (( ${#parts} == 6 )) || return 1
+  for part in "${parts[@]}"; do
+    [[ "${part}" =~ '^[0-9a-f]{1,2}$' ]] || return 1
+    value=$(( 16#${part} ))
+    printf -v formatted '%02x' "${value}"
+    if [[ -n "${output}" ]]; then
+      output+=":"
+    fi
+    output+="${formatted}"
+  done
+  REPLY="${output}"
+}
+
+valid_unicast_mac() {
+  local mac="$1"
+  local first
+  [[ "${mac}" != "00:00:00:00:00:00" && "${mac}" != "ff:ff:ff:ff:ff:ff" ]] || return 1
+  first="${mac[1,2]}"
+  (( (16#${first} & 1) == 0 ))
+}
+
+contains_value() {
+  local wanted="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [[ "${item}" == "${wanted}" ]] && return 0
+  done
+  return 1
+}
+
+root_owned_not_group_other_writable_no_acl() {
+  local path="$1"
+  local owner mode mode_value mode_token
+  owner="$("${STAT_BIN}" -f '%u' "${path}" 2>/dev/null)" || return 1
+  mode="$("${STAT_BIN}" -f '%Lp' "${path}" 2>/dev/null)" || return 1
+  [[ "${owner}" == "0" && "${mode}" == <-> ]] || return 1
+  mode_value=$(( 8#${mode} ))
+  (( (mode_value & 8#022) == 0 )) || return 1
+  mode_token="$(/bin/ls -lde "${path}" 2>/dev/null | /usr/bin/awk 'NR == 1 { print $1; exit }')" || return 1
+  [[ -n "${mode_token}" && "${mode_token}" != *+* ]]
+}
+
+validate_config_security() {
+  [[ "${TEST_MODE}" == "1" ]] && return 0
+  local config_parent="${config_path:h}"
+  [[ ! -L "${config_parent}" && -d "${config_parent}" ]] || return 1
+  [[ ! -L "${config_path}" && -f "${config_path}" ]] || return 1
+  root_owned_not_group_other_writable_no_acl "${config_parent}" || return 1
+  root_owned_not_group_other_writable_no_acl "${config_path}"
+}
+
+load_config() {
+  [[ -f "${config_path}" ]] || { fail "configuration not found: ${config_path}"; return 1; }
+  "${PLUTIL_BIN}" -lint "${config_path}" >/dev/null 2>&1 || {
+    fail "configuration is not a valid plist: ${config_path}"
+    return 1
+  }
+
+  local version
+  version="$(plist_raw Version)" || { fail "missing Version"; return 1; }
+  [[ "${version}" == "1" ]] || { fail "unsupported configuration version: ${version}"; return 1; }
+
+  cfg_bridge_policy="$(plist_raw BridgePolicy)" || { fail "missing BridgePolicy"; return 1; }
+  cfg_uplink_policy="$(plist_raw UplinkPolicy)" || { fail "missing UplinkPolicy"; return 1; }
+  cfg_guest_evidence="$(plist_raw GuestEvidence)" || { fail "missing GuestEvidence"; return 1; }
+  cfg_dry_run="$(plist_raw DryRun)" || { fail "missing DryRun"; return 1; }
+
+  [[ "${cfg_bridge_policy}" == "auto" || "${cfg_bridge_policy}" == "allowlist" ]] || {
+    fail "BridgePolicy must be auto or allowlist"
+    return 1
+  }
+  [[ "${cfg_uplink_policy}" == "explicit" || "${cfg_uplink_policy}" == "auto" ]] || {
+    fail "UplinkPolicy must be explicit or auto"
+    return 1
+  }
+  [[ "${cfg_guest_evidence}" == "learned-any" || "${cfg_guest_evidence}" == "allowlist" ]] || {
+    fail "GuestEvidence must be learned-any or allowlist"
+    return 1
+  }
+  [[ "${cfg_dry_run}" == "true" || "${cfg_dry_run}" == "false" ]] || {
+    fail "DryRun must be a boolean"
+    return 1
+  }
+
+  plist_array AllowedBridges || { fail "invalid AllowedBridges array"; return 1; }
+  cfg_allowed_bridges=("${PLIST_ARRAY_RESULT[@]}")
+  plist_array AllowedUplinks || { fail "invalid AllowedUplinks array"; return 1; }
+  cfg_allowed_uplinks=("${PLIST_ARRAY_RESULT[@]}")
+  plist_array AllowedGuestMACs || { fail "invalid AllowedGuestMACs array"; return 1; }
+  cfg_allowed_guest_macs=()
+
+  local value
+  for value in "${cfg_allowed_bridges[@]}"; do
+    valid_bridge_name "${value}" || { fail "invalid bridge name in allowlist: ${value}"; return 1; }
+  done
+  for value in "${cfg_allowed_uplinks[@]}"; do
+    valid_interface_name "${value}" || { fail "invalid uplink name in allowlist: ${value}"; return 1; }
+  done
+  for value in "${PLIST_ARRAY_RESULT[@]}"; do
+    normalize_mac "${value}" || { fail "invalid guest MAC in allowlist: ${value}"; return 1; }
+    valid_unicast_mac "${REPLY}" || { fail "guest MAC is not valid unicast: ${value}"; return 1; }
+    cfg_allowed_guest_macs+=("${REPLY}")
+  done
+
+  if [[ "${cfg_bridge_policy}" == "allowlist" && ${#cfg_allowed_bridges} -eq 0 ]]; then
+    fail "BridgePolicy allowlist requires at least one AllowedBridges entry"
+    return 1
+  fi
+  if [[ "${cfg_uplink_policy}" == "explicit" && ${#cfg_allowed_uplinks} -eq 0 ]]; then
+    fail "UplinkPolicy explicit requires at least one AllowedUplinks entry"
+    return 1
+  fi
+  if [[ "${cfg_guest_evidence}" == "allowlist" && ${#cfg_allowed_guest_macs} -eq 0 ]]; then
+    fail "GuestEvidence allowlist requires at least one AllowedGuestMACs entry"
+    return 1
+  fi
+}
+
+typeset inspect_eligible=0
+typeset inspect_actionable=0
+typeset inspect_reason=""
+typeset inspect_uplink=""
+typeset inspect_host_mac=""
+typeset inspect_signature=""
+typeset inspect_error=0
+
+inspect_bridge() {
+  local bridge="$1"
+  inspect_eligible=0
+  inspect_actionable=0
+  inspect_reason=""
+  inspect_uplink=""
+  inspect_host_mac=""
+  inspect_signature=""
+  inspect_error=0
+
+  local bridge_full uplink_full fdb first_line line member field
+  local bridge_flag_block bridge_flag member_flag uplink_status
+  local member_marker_hits member_flag_hits
+  local ether_hits status_hits ether_marker_hits status_marker_hits
+  local -a fields members vmenets non_vmenets bridge_flags
+  typeset -A member_set vmenet_set bridge_flag_set
+
+  bridge_full="$("${IFCONFIG_BIN}" "${bridge}" 2>/dev/null)" || {
+    inspect_reason="bridge disappeared or cannot be read"
+    inspect_error=1
+    return 0
+  }
+  first_line="${bridge_full%%$'\n'*}"
+  if ! [[ "${first_line}" =~ "^${bridge}:[[:space:]]+flags=[0-9A-Fa-f]+<([A-Z][A-Z0-9_]*(,[A-Z][A-Z0-9_]*)*)>([[:space:]]|$)" ]]; then
+    inspect_reason="bridge header flags cannot be parsed"
+    inspect_error=1
+    return 0
+  fi
+  bridge_flag_block="${match[1]}"
+  bridge_flags=("${(@s:,:)bridge_flag_block}")
+  for bridge_flag in "${bridge_flags[@]}"; do
+    if [[ -n "${bridge_flag_set[${bridge_flag}]-}" ]]; then
+      inspect_reason="bridge header contains duplicate flag tokens"
+      inspect_error=1
+      return 0
+    fi
+    bridge_flag_set[${bridge_flag}]=1
+  done
+  if ! contains_value UP "${bridge_flags[@]}" || \
+    ! contains_value RUNNING "${bridge_flags[@]}"; then
+    inspect_reason="bridge is not UP and RUNNING"
+    return 0
+  fi
+
+  members=()
+  for line in "${(@f)bridge_full}"; do
+    fields=(${=line})
+    if (( ${#fields} >= 1 )) && \
+      [[ "${fields[1]}" == member* && "${fields[1]}" != "member:" ]]; then
+      inspect_reason="bridge contains an unrecognized member record"
+      inspect_error=1
+      return 0
+    fi
+    member_marker_hits=0
+    member_flag_hits=0
+    member_flag=""
+    for field in "${fields[@]}"; do
+      [[ "${field}" == "member:" ]] && (( member_marker_hits++ ))
+      if [[ "${field}" == flags=* ]]; then
+        member_flag="${field}"
+        (( member_flag_hits++ ))
+      fi
+    done
+    (( member_marker_hits == 0 )) && continue
+    if (( member_marker_hits != 1 || ${#fields} != 3 || member_flag_hits != 1 )) || \
+      [[ "${fields[1]}" != "member:" || \
+         ! "${member_flag}" =~ '^flags=[0-9A-Fa-f]+<[A-Z][A-Z0-9_]*(,[A-Z][A-Z0-9_]*)*>$' ]]; then
+      inspect_reason="bridge contains a malformed or ambiguous member record"
+      inspect_error=1
+      return 0
+    fi
+    member="${fields[2]}"
+    valid_interface_name "${member}" || {
+      inspect_reason="bridge contains an invalid member name"
+      inspect_error=1
+      return 0
+    }
+    if [[ -n "${member_set[${member}]-}" ]]; then
+      inspect_reason="bridge contains duplicate member records"
+      inspect_error=1
+      return 0
+    fi
+    members+=("${member}")
+    member_set[${member}]=1
+  done
+  (( ${#members} >= 2 )) || {
+    inspect_reason="bridge has fewer than two members"
+    return 0
+  }
+
+  vmenets=()
+  non_vmenets=()
+  for member in "${members[@]}"; do
+    if [[ "${member}" =~ '^vmenet[0-9]+$' ]]; then
+      vmenets+=("${member}")
+      vmenet_set[${member}]=1
+    else
+      non_vmenets+=("${member}")
+    fi
+  done
+  (( ${#vmenets} >= 1 )) || {
+    inspect_reason="no vmenet member"
+    return 0
+  }
+  (( ${#non_vmenets} == 1 )) || {
+    inspect_reason="physical/uplink member is ambiguous"
+    return 0
+  }
+
+  inspect_uplink="${non_vmenets[1]}"
+  if [[ "${cfg_uplink_policy}" == "explicit" ]] && \
+    ! contains_value "${inspect_uplink}" "${cfg_allowed_uplinks[@]}"; then
+    inspect_reason="uplink is not in AllowedUplinks"
+    return 0
+  fi
+  if [[ "${cfg_uplink_policy}" == "auto" && ! "${inspect_uplink}" =~ '^en[0-9]+$' ]]; then
+    inspect_reason="auto uplink is not an en interface"
+    return 0
+  fi
+
+  uplink_full="$("${IFCONFIG_BIN}" "${inspect_uplink}" 2>/dev/null)" || {
+    inspect_reason="uplink cannot be read"
+    inspect_error=1
+    return 0
+  }
+
+  inspect_host_mac=""
+  ether_hits=0
+  status_hits=0
+  uplink_status=""
+  for line in "${(@f)uplink_full}"; do
+    fields=(${=line})
+    ether_marker_hits=0
+    status_marker_hits=0
+    for field in "${fields[@]}"; do
+      [[ "${field}" == "ether" ]] && (( ether_marker_hits++ ))
+      [[ "${field}" == "status:" ]] && (( status_marker_hits++ ))
+    done
+    if (( ether_marker_hits > 0 )); then
+      if (( ether_marker_hits != 1 || ${#fields} != 2 )) || [[ "${fields[1]}" != "ether" ]]; then
+        inspect_reason="uplink contains a malformed or ambiguous ether record"
+        inspect_error=1
+        return 0
+      fi
+      (( ether_hits++ ))
+      normalize_mac "${fields[2]}" || {
+        inspect_reason="uplink MAC cannot be parsed"
+        inspect_error=1
+        return 0
+      }
+      inspect_host_mac="${REPLY}"
+    fi
+    if (( status_marker_hits > 0 )); then
+      if (( status_marker_hits != 1 || ${#fields} != 2 )) || [[ "${fields[1]}" != "status:" ]]; then
+        inspect_reason="uplink contains a malformed or ambiguous status record"
+        inspect_error=1
+        return 0
+      fi
+      (( status_hits++ ))
+      uplink_status="${fields[2]}"
+    fi
+  done
+  if (( ether_hits != 1 )); then
+    inspect_reason="uplink must contain exactly one ether record"
+    inspect_error=1
+    return 0
+  fi
+  if (( status_hits != 1 )) || \
+    [[ "${uplink_status}" != "active" && "${uplink_status}" != "inactive" ]]; then
+    inspect_reason="uplink must contain exactly one recognized status record"
+    inspect_error=1
+    return 0
+  fi
+  if [[ "${uplink_status}" != "active" ]]; then
+    inspect_reason="uplink is not active"
+    return 0
+  fi
+  [[ -n "${inspect_host_mac}" ]] && valid_unicast_mac "${inspect_host_mac}" || {
+    inspect_reason="uplink has no valid unicast MAC"
+    return 0
+  }
+
+  fdb="$("${IFCONFIG_BIN}" "${bridge}" addr 2>/dev/null)" || {
+    inspect_reason="FDB cannot be read"
+    inspect_error=1
+    return 0
+  }
+
+  local raw_mac normalized_mac entry_iface flag is_host
+  local iface_hits flag_hits
+  local guest_evidence=0 host_total=0 target_total=0 malformed_fdb=0
+  for line in "${(@f)fdb}"; do
+    fields=(${=line})
+    (( ${#fields} >= 1 )) || continue
+    raw_mac="${fields[1]}"
+    if ! normalize_mac "${raw_mac}"; then
+      malformed_fdb=1
+      continue
+    fi
+    normalized_mac="${REPLY}"
+    is_host=0
+    if [[ "${normalized_mac}" == "${inspect_host_mac}" ]]; then
+      is_host=1
+      (( host_total++ ))
+    fi
+    if (( ${#fields} < 3 )); then
+      malformed_fdb=1
+      continue
+    fi
+    entry_iface=""
+    iface_hits=0
+    flag=""
+    flag_hits=0
+    for field in "${fields[@]}"; do
+      if valid_interface_name "${field}" && [[ -n "${member_set[${field}]-}" ]]; then
+        entry_iface="${field}"
+        (( iface_hits++ ))
+      fi
+      if [[ "${field}" == flags=* ]]; then
+        flag="${field}"
+        (( flag_hits++ ))
+      fi
+    done
+    if (( iface_hits != 1 || flag_hits != 1 )); then
+      malformed_fdb=1
+      continue
+    fi
+
+    if (( is_host == 1 )); then
+      if [[ "${entry_iface}" == "${inspect_uplink}" && "${flag}" == 'flags=0<>' ]]; then
+        (( target_total++ ))
+      fi
+      continue
+    fi
+
+    if [[ -n "${vmenet_set[${entry_iface}]-}" && "${flag}" == 'flags=0<>' ]] && \
+      valid_unicast_mac "${normalized_mac}"; then
+      if [[ "${cfg_guest_evidence}" == "learned-any" ]] || \
+        contains_value "${normalized_mac}" "${cfg_allowed_guest_macs[@]}"; then
+        guest_evidence=1
+      fi
+    fi
+  done
+
+  if (( malformed_fdb == 1 )); then
+    inspect_reason="FDB contains a malformed or ambiguous row"
+    inspect_error=1
+    return 0
+  fi
+
+  (( guest_evidence == 1 )) || {
+    inspect_reason="no accepted dynamic guest MAC learned on vmenet"
+    return 0
+  }
+
+  inspect_eligible=1
+  inspect_signature="${bridge_full}"$'\x1e'"${uplink_full}"$'\x1e'"${fdb}"
+  if (( host_total == 0 )); then
+    inspect_reason="topology accepted; stale host entry is absent"
+    return 0
+  fi
+  if (( host_total != 1 || target_total != 1 )); then
+    inspect_reason="host MAC entry is not one unique dynamic uplink entry"
+    return 0
+  fi
+
+  inspect_actionable=1
+  inspect_reason="unique dynamic stale host entry found"
+}
+
+typeset -a scan_bridges eligible_bridges
+typeset -A bridge_reason bridge_actionable bridge_uplink bridge_host_mac bridge_signature
+
+collect_bridges() {
+  scan_bridges=()
+  local name interfaces
+  typeset -A current_bridge_set
+  interfaces="$("${IFCONFIG_BIN}" -l 2>/dev/null)" || return 1
+  for name in ${=interfaces}; do
+    if valid_bridge_name "${name}"; then
+      current_bridge_set[${name}]=1
+      if [[ "${cfg_bridge_policy}" == "auto" ]]; then
+        scan_bridges+=("${name}")
+      fi
+    fi
+  done
+  if [[ "${cfg_bridge_policy}" == "allowlist" ]]; then
+    for name in "${cfg_allowed_bridges[@]}"; do
+      if [[ -n "${current_bridge_set[${name}]-}" ]]; then
+        scan_bridges+=("${name}")
+      fi
+    done
+  fi
+}
+
+scan_topology() {
+  eligible_bridges=()
+  bridge_reason=()
+  bridge_actionable=()
+  bridge_uplink=()
+  bridge_host_mac=()
+  bridge_signature=()
+  local scan_had_error=0
+
+  collect_bridges || { fail "cannot enumerate interfaces"; return 1; }
+  local bridge
+  for bridge in "${scan_bridges[@]}"; do
+    inspect_bridge "${bridge}"
+    bridge_reason[${bridge}]="${inspect_reason}"
+    bridge_actionable[${bridge}]="${inspect_actionable}"
+    bridge_uplink[${bridge}]="${inspect_uplink}"
+    bridge_host_mac[${bridge}]="${inspect_host_mac}"
+    bridge_signature[${bridge}]="${inspect_signature}"
+    (( inspect_error == 1 )) && scan_had_error=1
+    if (( inspect_eligible == 1 )); then
+      eligible_bridges+=("${bridge}")
+    fi
+    if [[ "${command_name}" == "scan" || "${command_name}" == "doctor" || ${verbose} -eq 1 ]]; then
+      print -- "SCAN bridge=${bridge} eligible=${inspect_eligible} actionable=${inspect_actionable} reason=${inspect_reason}"
+    fi
+  done
+  (( scan_had_error == 0 ))
+}
+
+acquire_lock() {
+  if [[ "${TEST_MODE}" != "1" ]]; then
+    local lock_parent="${LOCK_FILE:h}"
+    [[ ! -L "${lock_parent}" && -d "${lock_parent}" ]] || return 2
+    [[ ! -L "${LOCK_FILE}" && -f "${LOCK_FILE}" ]] || return 2
+    root_owned_not_group_other_writable_no_acl "${lock_parent}" || return 2
+    root_owned_not_group_other_writable_no_acl "${LOCK_FILE}" || return 2
+  else
+    [[ ! -L "${LOCK_FILE}" && -f "${LOCK_FILE}" ]] || return 2
+  fi
+
+  exec 9<> "${LOCK_FILE}" || return 2
+  /usr/bin/lockf -s -t 0 9
+  local lock_status=$?
+  if (( lock_status == 0 )); then
+    return 0
+  fi
+  exec 9>&-
+  (( lock_status == 75 )) && return 1
+  return 2
+}
+
+verify_removed() {
+  local bridge="$1" host_mac="$2"
+  local fdb line raw_mac
+  local -a fields
+  fdb="$("${IFCONFIG_BIN}" "${bridge}" addr 2>/dev/null)" || return 1
+  for line in "${(@f)fdb}"; do
+    fields=(${=line})
+    (( ${#fields} >= 1 )) || continue
+    raw_mac="${fields[1]}"
+    if normalize_mac "${raw_mac}" && [[ "${REPLY}" == "${host_mac}" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+process_bridge() {
+  local bridge="$1"
+  local first_signature="${bridge_signature[${bridge}]}"
+  local first_uplink="${bridge_uplink[${bridge}]}"
+  local first_host_mac="${bridge_host_mac[${bridge}]}"
+  local first_candidates="${(j:,:)eligible_bridges}"
+
+  [[ "${bridge_actionable[${bridge}]}" == "1" ]] || return 0
+
+  if ! scan_topology; then
+    log_error "full topology rescan failed before mutation"
+    return 1
+  fi
+  if (( ${#eligible_bridges} != 1 )) || \
+    [[ "${eligible_bridges[1]-}" != "${bridge}" || \
+       "${(j:,:)eligible_bridges}" != "${first_candidates}" || \
+       "${bridge_actionable[${bridge}]-0}" != "1" || \
+       "${bridge_signature[${bridge}]-}" != "${first_signature}" || \
+       "${bridge_uplink[${bridge}]-}" != "${first_uplink}" || \
+       "${bridge_host_mac[${bridge}]-}" != "${first_host_mac}" ]]; then
+    [[ ${verbose} -eq 1 ]] && print -- "SKIP bridge=${bridge} reason=topology changed during validation"
+    return 0
+  fi
+
+  local effective_dry_run=${cli_dry_run}
+  [[ "${cfg_dry_run}" == "true" ]] && effective_dry_run=1
+  if (( effective_dry_run == 1 )); then
+    print -- "WOULD_DELETE bridge=${bridge} uplink=${first_uplink} mac=${first_host_mac}"
+    return 0
+  fi
+
+  if (( EUID != 0 )) && [[ "${TEST_MODE}" != "1" ]]; then
+    fail "run must be executed as root when a stale entry is present"
+    return 1
+  fi
+
+  if ! "${IFCONFIG_BIN}" "${bridge}" deladdr "${first_host_mac}"; then
+    log_error "failed to remove ${first_host_mac} from ${bridge}"
+    return 1
+  fi
+  if ! verify_removed "${bridge}" "${first_host_mac}"; then
+    log_error "verification failed after removing ${first_host_mac} from ${bridge}"
+    return 1
+  fi
+
+  print -- "REMOVED bridge=${bridge} uplink=${first_uplink} mac=${first_host_mac}"
+  if [[ -x "${LOGGER_BIN}" ]]; then
+    "${LOGGER_BIN}" -t utm-bridge-fdb-guard \
+      "Removed ${first_host_mac} learned on ${first_uplink} from ${bridge}" 2>/dev/null || true
+  fi
+}
+
+load_config || exit 2
+
+if [[ "${command_name}" == "run" || "${command_name}" == "doctor" ]]; then
+  if ! validate_config_security; then
+    log_error "configuration and its parent must be root-owned, non-writable by group/others, and free of ACLs: ${config_path}"
+    exit 2
+  fi
+fi
+
+if [[ "${command_name}" == "doctor" ]]; then
+  print "version=${TOOL_VERSION}"
+  print "config=${config_path}"
+  print "config_security=ok"
+  scan_topology || { log_error "topology scan failed"; exit 2; }
+  if "${LAUNCHCTL_BIN}" print "system/${SERVICE_LABEL}" >/dev/null 2>&1; then
+    print "launchd=loaded"
+  else
+    print "launchd=not-loaded"
+  fi
+  print "eligible_bridges=${#eligible_bridges}"
+  exit 0
+fi
+
+if [[ "${command_name}" == "run" ]]; then
+  acquire_lock
+  lock_status=$?
+  if (( lock_status == 1 )); then
+    exit 0
+  fi
+  if (( lock_status != 0 )); then
+    log_error "cannot acquire the validated advisory lock: ${LOCK_FILE}"
+    exit 2
+  fi
+fi
+
+scan_topology || { log_error "topology scan failed"; exit 2; }
+
+if (( ${#eligible_bridges} > 1 )); then
+  if [[ "${command_name}" == "scan" || ${verbose} -eq 1 ]]; then
+    print -- "AMBIGUOUS eligible_bridges=${(j:,:)eligible_bridges}; no action"
+  fi
+  exit 0
+fi
+
+if [[ "${command_name}" == "scan" ]]; then
+  print "SUMMARY eligible_bridges=${#eligible_bridges}"
+  for bridge in "${eligible_bridges[@]}"; do
+    if [[ "${bridge_actionable[${bridge}]}" == "1" ]]; then
+      print -- "WOULD_DELETE bridge=${bridge} uplink=${bridge_uplink[${bridge}]} mac=${bridge_host_mac[${bridge}]}"
+    fi
+  done
+  exit 0
+fi
+
+for bridge in "${eligible_bridges[@]}"; do
+  process_bridge "${bridge}" || exit 1
+done
+
+exit 0

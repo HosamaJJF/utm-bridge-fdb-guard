@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check zsh syntax
+        shell: zsh {0}
+        run: |
+          files=(
+            bin/utm-bridge-fdb-guard
+            scripts/*.zsh
+            tests/*.zsh
+          )
+          for file in "${files[@]}"; do
+            /bin/zsh -n "${file}"
+          done
+
+      - name: Validate property lists
+        shell: zsh {0}
+        run: |
+          for file in launchd/*.plist tests/fixtures/config-*.plist; do
+            /usr/bin/plutil -lint "${file}"
+          done
+
+      - name: Scan for accidentally committed private data
+        run: /bin/zsh tests/privacy-scan.zsh
+
+      - name: Run fixture tests
+        run: /bin/zsh tests/unit.zsh
+
+      - name: Verify root-owned ACL rejection
+        run: /usr/bin/sudo /bin/zsh tests/root-security.zsh
+
+      - name: Exercise the root install lifecycle in dry-run mode
+        run: >-
+          /usr/bin/sudo /usr/bin/env GITHUB_ACTIONS=true RUNNER_TEMP="${RUNNER_TEMP}"
+          /bin/zsh tests/install-lifecycle.zsh

@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag and version
+        shell: zsh {0}
+        run: |
+          version="$(<VERSION)"
+          [[ "${GITHUB_REF_NAME}" == "v${version}" ]]
+          [[ "$(git describe --tags --exact-match HEAD)" == "${GITHUB_REF_NAME}" ]]
+          git diff --exit-code
+
+      - name: Validate scripts and property lists
+        shell: zsh {0}
+        run: |
+          for file in bin/utm-bridge-fdb-guard scripts/*.zsh tests/*.zsh; do
+            /bin/zsh -n "${file}"
+          done
+          for file in launchd/*.plist tests/fixtures/config-*.plist; do
+            /usr/bin/plutil -lint "${file}"
+          done
+
+      - name: Run privacy and fixture tests
+        run: |
+          /bin/zsh tests/privacy-scan.zsh
+          /bin/zsh tests/unit.zsh
+
+      - name: Verify root security and install lifecycle
+        run: |
+          /usr/bin/sudo /bin/zsh tests/root-security.zsh
+          /usr/bin/sudo /usr/bin/env GITHUB_ACTIONS=true RUNNER_TEMP="${RUNNER_TEMP}" /bin/zsh tests/install-lifecycle.zsh
+
+      - name: Build and verify release assets
+        run: |
+          /bin/zsh scripts/package.zsh
+          cd dist
+          /usr/bin/shasum -a 256 -c SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/utm-bridge-fdb-guard-*.tar.gz dist/SHA256SUMS
+          --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
