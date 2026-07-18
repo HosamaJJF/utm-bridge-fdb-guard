@@ -1,12 +1,12 @@
 # UTM Bridge FDB Guard
 
-[简体中文](README.zh-CN.md) · [Technical background](docs/technical-background.md) · [Security notes](SECURITY.md)
+[简体中文](README.zh-CN.md) · [Technical background](docs/technical-background.md)
 
-`utm-bridge-fdb-guard` is a small macOS helper I put together while troubleshooting a stale bridge forwarding-database (FDB) entry that disrupted connectivity between my Mac and a bridged UTM guest.
+`utm-bridge-fdb-guard` is a small macOS LaunchDaemon for a specific stale bridge forwarding-database (FDB) problem that can disrupt connectivity between a Mac host and a bridged UTM guest.
 
-I made the original workaround reusable because it may help someone with the same rather specific problem. It discovers the live bridge topology on every run instead of pinning a virtual machine MAC address, bridge number, `vmenet` number, or host MAC address. It removes one exact dynamic FDB entry only when the expected evidence agrees; otherwise it leaves the network alone.
+The original machine-specific workaround was made reusable by discovering the live bridge topology on every run instead of pinning a virtual machine MAC address, bridge number, `vmenet` number, or host MAC address. It removes one exact dynamic FDB entry only when the expected evidence agrees; otherwise it leaves the network alone.
 
-> This is a personal, best-effort project shared as-is. I may update it when I have the time and need, but there is no support promise, response-time commitment, maintenance schedule, roadmap, or compatibility guarantee. It is not an upstream fix from Apple or UTM.
+This project is provided as-is and may not receive further maintenance or compatibility updates. It is not an upstream fix from Apple or UTM.
 
 ## Why this exists
 
@@ -165,12 +165,6 @@ A later normal install reuses that preserved configuration after validating that
 - Diagnostic output can contain interface MAC addresses. Redact them before posting publicly if they are sensitive in your environment.
 
 For the underlying decision model and limitations, see [docs/technical-background.md](docs/technical-background.md). A related UTM discussion is [UTM issue #7121](https://github.com/utmapp/UTM/issues/7121).
-
-## Issues and patches
-
-Sanitized bug reports and small patches are welcome, but responses and fixes are best-effort and may take time—or may not happen. If you change the parser, please include fixtures for both the accepted form and nearby forms that should be rejected. CI must never perform a real `ifconfig ... deladdr` operation.
-
-If you notice a security-sensitive problem, [SECURITY.md](SECURITY.md) explains the available private reporting option and the project's maintenance limits.
 
 ## License
 

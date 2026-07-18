@@ -1,12 +1,12 @@
 # UTM Bridge FDB Guard
 
-[English](README.md) · [技术原理](docs/technical-background.md) · [安全说明](SECURITY.md)
+[English](README.md) · [技术原理](docs/technical-background.md)
 
-`utm-bridge-fdb-guard` 是我在排查自己 Mac 与 UTM 桥接虚拟机无法通信的问题时，顺手整理出来的一个小工具。它处理的是一类比较具体的陈旧桥接转发表（FDB）记录问题。
+`utm-bridge-fdb-guard` 是一个用于处理特定陈旧桥接转发表（FDB）问题的 macOS LaunchDaemon。这类问题可能导致 Mac 宿主机与 UTM 桥接虚拟机之间无法通信。
 
-我把原先针对自己机器的处理方式改成了可复用形式，希望对遇到同类问题的人也有一点帮助。程序每次运行都会从当前网络状态重新发现 bridge、`vmenet`、物理上联接口和宿主 MAC，**不会固定虚拟机 MAC、bridge 编号、`vmenet` 编号或宿主 MAC**。只有预期证据能够互相印证时，它才删除一条明确的动态 FDB 记录；拿不准就不动网络。
+原本针对单台机器的处理方式被整理成了可复用形式。程序每次运行都会从当前网络状态重新发现 bridge、`vmenet`、物理上联接口和宿主 MAC，**不会固定虚拟机 MAC、bridge 编号、`vmenet` 编号或宿主 MAC**。只有预期证据能够互相印证时，它才删除一条明确的动态 FDB 记录；拿不准就不动网络。
 
-> 这是一个按现状分享的个人项目。我可能会在自己有时间、有需要时继续调整，但不承诺支持时限、回复速度、维护周期、路线图或长期兼容性。它也不是 Apple 或 UTM 提供的上游修复。
+本项目按现状提供，后续不一定会继续维护或跟进兼容性变化。它也不是 Apple 或 UTM 提供的上游修复。
 
 ## 问题表现
 
@@ -166,12 +166,6 @@ sudo ./scripts/uninstall.zsh --keep-config
 - 诊断输出可能包含接口 MAC；如认为这些信息敏感，请在公开提交前进行脱敏。
 
 更完整的判断模型与限制见 [docs/technical-background.md](docs/technical-background.md)。相关讨论可参考 [UTM issue #7121](https://github.com/utmapp/UTM/issues/7121)。
-
-## 问题反馈与修改
-
-欢迎提交已经脱敏的问题信息或小改动，但回复和修复都只能随缘、尽力而为，可能较慢，也可能暂时不会处理。涉及解析器的修改最好同时加入“应接受”和相邻“应拒绝”的测试夹具；CI 不得真正执行 `ifconfig ... deladdr`。
-
-如果发现涉及安全的问题，[SECURITY.md](SECURITY.md) 说明了可用的私密反馈方式，也明确了这个个人项目不提供哪些维护承诺。
 
 ## 许可证
 

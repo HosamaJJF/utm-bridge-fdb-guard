@@ -61,7 +61,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 /bin/mkdir -p "${DIST}" "${temp_dir}/${NAME}"
-for path in .github .gitignore CHANGELOG.md LICENSE README.md README.zh-CN.md SECURITY.md VERSION bin docs launchd scripts tests; do
+for path in .github .gitignore CHANGELOG.md LICENSE README.md README.zh-CN.md VERSION bin docs launchd scripts tests; do
   source_special="$(/usr/bin/find "${ROOT}/${path}" ! -type d ! -type f -print -quit)"
   [[ -z "${source_special}" ]] || {
     print -u2 -- "Refusing to package a symbolic link or special file: ${source_special}"

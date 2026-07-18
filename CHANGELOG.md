@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
-- Reframed the repository as a best-effort personal utility and removed maintenance and response-time promises.
+- Simplified the repository documentation and clarified that ongoing maintenance should not be expected.
 
 ## [1.0.0] - 2026-07-18
 
